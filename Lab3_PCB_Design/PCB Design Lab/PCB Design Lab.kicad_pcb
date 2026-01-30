@@ -3369,7 +3369,7 @@
 			)
 		)
 		(property "Value" "Conn_01x04_Pin"
-			(at 0.475 10.3 90)
+			(at -1.525 3.8 180)
 			(layer "F.Fab")
 			(uuid "e46f62e0-4b56-4101-8ae4-8faae3f9d31b")
 			(effects
