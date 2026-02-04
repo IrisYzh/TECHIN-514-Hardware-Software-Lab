@@ -1,0 +1,190 @@
+#define ENABLE_USER_AUTH
+#define ENABLE_DATABASE
+
+#include <Arduino.h>
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <FirebaseClient.h>
+#include "secrets.h"
+
+// -------------------- HC-SR04 Pins --------------------
+const int TRIG_PIN = 3;
+const int ECHO_PIN = 4;
+
+// -------------------- Upload Interval --------------------
+const uint32_t UPLOAD_INTERVAL_MS = 5000;  // Upload every 5 seconds
+
+// -------------------- Firebase Objects --------------------
+UserAuth user_auth(FIREBASE_API_KEY, FIREBASE_USER_EMAIL, FIREBASE_USER_PASSWORD);
+FirebaseApp app;
+WiFiClientSecure ssl_client1, ssl_client2;
+using AsyncClient = AsyncClientClass;
+AsyncClient async_client1(ssl_client1), async_client2(ssl_client2);
+RealtimeDatabase Database;
+AsyncResult dbResult;
+
+bool firebaseReady = false;
+
+// -------------------- Callback --------------------
+void asyncCallback(AsyncResult &aResult) {
+  if (aResult.isEvent()) {
+    Firebase.printf("Event: %s, msg: %s, code: %d\n",
+                    aResult.uid().c_str(),
+                    aResult.appEvent().message().c_str(),
+                    aResult.appEvent().code());
+  }
+
+  if (aResult.isError()) {
+    Firebase.printf("Error: %s, msg: %s, code: %d\n",
+                    aResult.uid().c_str(),
+                    aResult.error().message().c_str(),
+                    aResult.error().code());
+  }
+
+  if (aResult.available()) {
+    Firebase.printf("Success: %s, data: %s\n",
+                    aResult.uid().c_str(),
+                    aResult.c_str());
+  }
+}
+
+// -------------------- WiFi Connection --------------------
+bool connectWiFi() {
+  Serial.println("\nConnecting to WiFi...");
+  Serial.printf("SSID: %s\n", WIFI_SSID);
+  
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+
+  uint32_t startTime = millis();
+  while (WiFi.status() != WL_CONNECTED && (millis() - startTime) < 10000) {
+    delay(500);
+    Serial.print(".");
+  }
+  
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\nWiFi Connected!");
+    Serial.printf("IP: %s\n", WiFi.localIP().toString().c_str());
+    return true;
+  } else {
+    Serial.println("\nWiFi Failed!");
+    return false;
+  }
+}
+
+// -------------------- Firebase Init --------------------
+void initFirebase() {
+  Serial.println("\nInitializing Firebase...");
+  
+  ssl_client1.setInsecure();
+  ssl_client2.setInsecure();
+  
+  initializeApp(async_client1, app, getAuth(user_auth), asyncCallback, "authTask");
+  app.getApp<RealtimeDatabase>(Database);
+  Database.url(FIREBASE_RTDB_URL);
+  
+  Serial.println("Waiting for authentication...");
+  uint32_t startTime = millis();
+  while (!app.ready() && (millis() - startTime) < 15000) {
+    app.loop();
+    delay(100);
+  }
+  
+  if (app.ready()) {
+    Serial.println("Firebase Ready!\n");
+    firebaseReady = true;
+  } else {
+    Serial.println("Firebase Timeout!\n");
+    firebaseReady = false;
+  }
+}
+
+// -------------------- Read HC-SR04 --------------------
+float readDistance() {
+  pinMode(TRIG_PIN, OUTPUT);
+  pinMode(ECHO_PIN, INPUT);
+  
+  digitalWrite(TRIG_PIN, LOW);
+  delayMicroseconds(2);
+  digitalWrite(TRIG_PIN, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(TRIG_PIN, LOW);
+  
+  uint32_t duration = pulseIn(ECHO_PIN, HIGH, 25000);
+  
+  if (duration == 0) {
+    return -1.0;
+  }
+  
+  float distanceCm = duration / 58.2;
+  return distanceCm;
+}
+
+// -------------------- Upload to Firebase --------------------
+void uploadToFirebase(float distance) {
+  if (!firebaseReady) {
+    Serial.println("Firebase not ready");
+    return;
+  }
+  
+  Serial.println("Uploading to Firebase...");
+  
+  uint32_t timestamp = millis();
+  
+  // Upload current reading
+  Database.set<float>(async_client1, "/sensor/distance_cm", distance, asyncCallback, "set_distance");
+  Database.set<uint32_t>(async_client1, "/sensor/timestamp", timestamp, asyncCallback, "set_time");
+  
+  // Upload to history
+  String historyPath = "/sensor/history/" + String(timestamp);
+  Database.set<float>(async_client1, historyPath + "/distance_cm", distance, asyncCallback, "set_history");
+  
+  app.loop();
+  delay(100);
+}
+
+// -------------------- Setup --------------------
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+  
+  Serial.println("\n========================================");
+  Serial.println("  HC-SR04 to Firebase");
+  Serial.println("========================================");
+  
+  if (!connectWiFi()) {
+    Serial.println("ERROR: Check WiFi credentials!");
+    while (true) delay(1000);
+  }
+  
+  initFirebase();
+  
+  if (!firebaseReady) {
+    Serial.println("ERROR: Check Firebase credentials!");
+    while (true) delay(1000);
+  }
+  
+  Serial.println("Setup Complete!\n");
+}
+
+// -------------------- Loop --------------------
+void loop() {
+  static uint32_t lastUpload = 0;
+  
+  if (millis() - lastUpload >= UPLOAD_INTERVAL_MS) {
+    lastUpload = millis();
+    
+    Serial.println("========== Reading ==========");
+    float distance = readDistance();
+    
+    if (distance > 0) {
+      Serial.printf("Distance: %.2f cm\n", distance);
+      uploadToFirebase(distance);
+    } else {
+      Serial.println("Read failed");
+    }
+  }
+  
+  app.loop();
+  delay(50);
+}

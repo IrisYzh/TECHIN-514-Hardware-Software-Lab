@@ -1,0 +1,318 @@
+#define ENABLE_USER_AUTH
+#define ENABLE_DATABASE
+
+#include <Arduino.h>
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <FirebaseClient.h>
+#include "secrets.h"
+
+// ============================================
+// TRANSMISSION FREQUENCY SELECTION
+// ============================================
+// Uncomment ONE of the following to select transmission rate:
+
+// #define FREQ_2HZ      // 2 times per second (500 ms interval)
+// #define FREQ_1HZ      // 1 time per second (1000 ms interval)
+#define FREQ_0_5HZ    // Once every 2 seconds (2000 ms interval)
+// #define FREQ_0_33HZ   // Once every 3 seconds (3000 ms interval)
+// #define FREQ_0_25HZ   // Once every 4 seconds (4000 ms interval)
+
+// ============================================
+
+// Set upload interval based on selected frequency
+#ifdef FREQ_2HZ
+  const uint32_t UPLOAD_INTERVAL_MS = 500;
+  const char* FREQ_NAME = "2.0 Hz (2 times/sec)";
+  const float FREQUENCY = 2.0;
+#elif defined(FREQ_1HZ)
+  const uint32_t UPLOAD_INTERVAL_MS = 1000;
+  const char* FREQ_NAME = "1.0 Hz (1 time/sec)";
+  const float FREQUENCY = 1.0;
+#elif defined(FREQ_0_5HZ)
+  const uint32_t UPLOAD_INTERVAL_MS = 2000;
+  const char* FREQ_NAME = "0.5 Hz (every 2 sec)";
+  const float FREQUENCY = 0.5;
+#elif defined(FREQ_0_33HZ)
+  const uint32_t UPLOAD_INTERVAL_MS = 3000;
+  const char* FREQ_NAME = "0.333 Hz (every 3 sec)";
+  const float FREQUENCY = 0.333;
+#elif defined(FREQ_0_25HZ)
+  const uint32_t UPLOAD_INTERVAL_MS = 4000;
+  const char* FREQ_NAME = "0.25 Hz (every 4 sec)";
+  const float FREQUENCY = 0.25;
+#else
+  #error "Please select a transmission frequency by uncommenting one of the #define FREQ_xxx lines above"
+#endif
+
+// HC-SR04 Pins
+const int PIN_TRIG = 2;  // D0 on XIAO ESP32-C3
+const int PIN_ECHO = 3;  // D1 on XIAO ESP32-C3
+
+// Firebase objects
+UserAuth user_auth(FIREBASE_API_KEY, FIREBASE_USER_EMAIL, FIREBASE_USER_PASSWORD);
+FirebaseApp app;
+WiFiClientSecure ssl_client1, ssl_client2;
+using AsyncClient = AsyncClientClass;
+AsyncClient async_client1(ssl_client1), async_client2(ssl_client2);
+RealtimeDatabase Database;
+AsyncResult dbResult;
+
+bool firebaseReady = false;
+uint32_t uploadCount = 0;
+uint32_t successCount = 0;
+uint32_t failCount = 0;
+
+// Statistics
+float minDistance = 9999.0;
+float maxDistance = 0.0;
+float totalDistance = 0.0;
+uint32_t readingCount = 0;
+
+// ============================================
+// HELPER FUNCTIONS
+// ============================================
+
+void processData(AsyncResult &aResult) {
+  if (!aResult.isResult()) return;
+  
+  if (aResult.isEvent())
+    Firebase.printf("Event: %s, msg: %s, code: %d\n", 
+                    aResult.uid().c_str(), 
+                    aResult.eventLog().message().c_str(), 
+                    aResult.eventLog().code());
+  
+  if (aResult.isError()) {
+    Firebase.printf("Error: %s, msg: %s, code: %d\n", 
+                    aResult.uid().c_str(), 
+                    aResult.error().message().c_str(), 
+                    aResult.error().code());
+    failCount++;
+  }
+  
+  if (aResult.available()) {
+    Firebase.printf("Success: %s\n", aResult.uid().c_str());
+    successCount++;
+  }
+}
+
+bool connectWiFi() {
+  Serial.println("\n--- Connecting to WiFi ---");
+  Serial.printf("SSID: %s\n", WIFI_SSID);
+  
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+
+  uint32_t startTime = millis();
+  while (WiFi.status() != WL_CONNECTED && (millis() - startTime) < 10000) {
+    delay(500);
+    Serial.print(".");
+  }
+  
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\nWiFi Connected!");
+    Serial.printf("IP Address: %s\n", WiFi.localIP().toString().c_str());
+    Serial.printf("Signal Strength: %d dBm\n", WiFi.RSSI());
+    return true;
+  } else {
+    Serial.println("\nWiFi Connection Failed!");
+    return false;
+  }
+}
+
+void initFirebase() {
+  Serial.println("\n--- Initializing Firebase ---");
+  
+  ssl_client1.setInsecure();
+  ssl_client2.setInsecure();
+  ssl_client1.setHandshakeTimeout(10);
+  ssl_client2.setHandshakeTimeout(10);
+  
+  initializeApp(async_client1, app, getAuth(user_auth), processData, "authTask");
+  app.getApp<RealtimeDatabase>(Database);
+  Database.url(FIREBASE_RTDB_URL);
+  
+  Serial.println("Waiting for Firebase authentication...");
+  uint32_t startTime = millis();
+  while (!app.ready() && (millis() - startTime) < 15000) {
+    app.loop();
+    delay(100);
+  }
+  
+  if (app.ready()) {
+    Serial.println("Firebase Ready!\n");
+    firebaseReady = true;
+  } else {
+    Serial.println("Firebase Authentication Timeout!\n");
+    firebaseReady = false;
+  }
+}
+
+float readUltrasonicDistance() {
+  pinMode(PIN_TRIG, OUTPUT);
+  pinMode(PIN_ECHO, INPUT);
+
+  // Send trigger pulse
+  digitalWrite(PIN_TRIG, LOW);
+  delayMicroseconds(2);
+  digitalWrite(PIN_TRIG, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(PIN_TRIG, LOW);
+
+  // Read echo pulse
+  uint32_t duration = pulseIn(PIN_ECHO, HIGH, 30000);
+  
+  if (duration == 0) {
+    return -1.0;  // Timeout or no echo
+  }
+
+  // Calculate distance in cm
+  float distanceCm = duration / 58.2;
+  
+  // Validate range (2-400 cm for HC-SR04)
+  if (distanceCm < 2.0 || distanceCm > 400.0) {
+    return -1.0;
+  }
+  
+  return distanceCm;
+}
+
+void uploadToFirebase(float distance) {
+  if (!firebaseReady) {
+    Serial.println("Firebase not ready, skipping upload");
+    failCount++;
+    return;
+  }
+  
+  uploadCount++;
+  uint32_t timestamp = millis();
+  
+  // Create structured path
+  String basePath = "/frequency_test/" + String(FREQUENCY, 3) + "Hz/upload_" + String(uploadCount);
+  
+  Serial.printf("\n[Upload #%u] Distance: %.2f cm | Time: %u ms\n", 
+                uploadCount, distance, timestamp);
+  
+  // Upload distance, timestamp, and frequency info
+  Database.set<float>(async_client1, basePath + "/distance_cm", distance, processData, "upload_distance");
+  Database.set<uint32_t>(async_client1, basePath + "/timestamp_ms", timestamp, dbResult);
+  Database.set<float>(async_client1, basePath + "/frequency_hz", FREQUENCY, dbResult);
+  
+  // Update latest reading
+  Database.set<float>(async_client1, "/frequency_test/" + String(FREQUENCY, 3) + "Hz/latest/distance_cm", distance, dbResult);
+  Database.set<uint32_t>(async_client1, "/frequency_test/" + String(FREQUENCY, 3) + "Hz/latest/timestamp_ms", timestamp, dbResult);
+  Database.set<uint32_t>(async_client1, "/frequency_test/" + String(FREQUENCY, 3) + "Hz/latest/upload_count", uploadCount, dbResult);
+  
+  // Keep async operations running
+  app.loop();
+  delay(50);
+}
+
+void printStatistics() {
+  Serial.println("\n========================================");
+  Serial.println("STATISTICS");
+  Serial.println("========================================");
+  Serial.printf("Total Readings: %u\n", readingCount);
+  Serial.printf("Successful Uploads: %u\n", successCount);
+  Serial.printf("Failed Uploads: %u\n", failCount);
+  Serial.printf("Success Rate: %.1f%%\n", (float)successCount / uploadCount * 100);
+  
+  if (readingCount > 0) {
+    Serial.printf("\nDistance Statistics:\n");
+    Serial.printf("  Average: %.2f cm\n", totalDistance / readingCount);
+    Serial.printf("  Minimum: %.2f cm\n", minDistance);
+    Serial.printf("  Maximum: %.2f cm\n", maxDistance);
+  }
+  
+  Serial.printf("\nUptime: %.1f seconds\n", millis() / 1000.0);
+  Serial.printf("Expected Uploads: %.1f\n", (millis() / 1000.0) * FREQUENCY);
+  Serial.println("========================================\n");
+}
+
+// ============================================
+// ARDUINO SETUP
+// ============================================
+
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+  
+  Serial.println("\n\n");
+  Serial.println("========================================");
+  Serial.println("  Firebase Transmission Frequency Test  ");
+  Serial.println("========================================");
+  Serial.printf("Frequency: %s\n", FREQ_NAME);
+  Serial.printf("Upload Interval: %u ms\n", UPLOAD_INTERVAL_MS);
+  Serial.printf("Frequency Value: %.3f Hz\n", FREQUENCY);
+  Serial.println("========================================");
+  
+  // Connect to WiFi
+  if (!connectWiFi()) {
+    Serial.println("\nERROR: Cannot proceed without WiFi!");
+    Serial.println("Please check your WiFi credentials in secrets.h");
+    while (true) {
+      delay(1000);
+    }
+  }
+  
+  // Initialize Firebase
+  initFirebase();
+  
+  if (!firebaseReady) {
+    Serial.println("\nERROR: Cannot proceed without Firebase!");
+    Serial.println("Please check your Firebase credentials in secrets.h");
+    while (true) {
+      delay(1000);
+    }
+  }
+  
+  Serial.println("\n>>> Test Started! <<<");
+  Serial.println(">>> Run for at least 2 minutes for accurate measurements <<<");
+  Serial.println(">>> Monitor with Power Profiler <<<\n");
+  
+  delay(1000);
+}
+
+// ============================================
+// ARDUINO LOOP
+// ============================================
+
+void loop() {
+  static uint32_t lastUpload = 0;
+  static uint32_t lastStats = 0;
+  
+  // Check if it's time to upload
+  if (millis() - lastUpload >= UPLOAD_INTERVAL_MS) {
+    lastUpload = millis();
+    
+    // Read ultrasonic sensor
+    float distance = readUltrasonicDistance();
+    
+    if (distance > 0) {
+      // Update statistics
+      readingCount++;
+      totalDistance += distance;
+      if (distance < minDistance) minDistance = distance;
+      if (distance > maxDistance) maxDistance = distance;
+      
+      // Upload to Firebase
+      uploadToFirebase(distance);
+      
+    } else {
+      Serial.println("Sensor read failed - no valid echo");
+      failCount++;
+    }
+  }
+  
+  // Print statistics every 30 seconds
+  if (millis() - lastStats >= 30000) {
+    lastStats = millis();
+    printStatistics();
+  }
+  
+  // Keep Firebase connection alive
+  app.loop();
+  processData(dbResult);
+  
+  delay(50);
+}
